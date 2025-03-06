@@ -1,360 +1,312 @@
 import sys
-import os
-import cv2
-import time
-import threading
-import queue
-from datetime import datetime, timedelta
-import numpy as np
-from pyzbar.pyzbar import decode, ZBarSymbol
-
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMutex
+from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QLineEdit, QPushButton, QFileDialog, QMessageBox
+from PyQt5.QtCore import QTimer, QThread
 from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QLabel, QPushButton, QVBoxLayout,
-    QHBoxLayout, QWidget, QMessageBox, QFileDialog, QLineEdit
-)
+import cv2
+import datetime
+import os
+from pyzbar.pyzbar import decode
+from queue import Queue
+import subprocess
+import numpy as np
 
-# ------------------------------
-# WriterThread: Luồng ghi video sử dụng queue
-# ------------------------------
-class WriterThread(threading.Thread):
-    def __init__(self, video_writer, frame_queue):
-        super().__init__()
-        self.video_writer = video_writer
-        self.frame_queue = frame_queue
-        self.running = True
+# Kiểm tra GPU
+try:
+    import cupy as cp
+    GPU_AVAILABLE = True
+except ImportError:
+    GPU_AVAILABLE = False
 
-    def run(self):
-        while self.running:
-            frame = self.frame_queue.get()
-            if frame is None:  # tín hiệu dừng
-                break
-            self.video_writer.write(frame)
-            self.frame_queue.task_done()
-        while not self.frame_queue.empty():
-            frame = self.frame_queue.get()
-            if frame is not None:
-                self.video_writer.write(frame)
-            self.frame_queue.task_done()
-        self.video_writer.release()
+import subprocess
 
-    def stop(self):
-        self.running = False
-        self.frame_queue.put(None)
-        self.join()
+from PyQt5.QtCore import QThread
+import subprocess
+import queue
 
-# ------------------------------
-# VideoCaptureThread: Đọc frame từ webcam
-# ------------------------------
-class VideoCaptureThread(QThread):
-    newFrameSignal = pyqtSignal()
-
-    def __init__(self, camera_index=0, parent=None):
-        super().__init__(parent)
-        self.camera_index = camera_index
-        self.running = True
-        # Mở webcam với backend DirectShow, đặt codec MJPG để tối đa FPS
-        self.cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        # Sử dụng độ phân giải 1280x720 để giảm tải
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self.cap.set(cv2.CAP_PROP_FPS, 60)
-
-        self.latest_frame = None
-        self.mutex = QMutex()
+class RecorderThread(QThread):
+    def __init__(self, width, height, fps, file_path1, file_path2, frame_queue1, frame_queue2, running):
+        super().__init__() # Add super().__init__() to properly initialize QThread
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.file_path1 = file_path1
+        self.file_path2 = file_path2
+        self.frame_queue1 = frame_queue1
+        self.frame_queue2 = frame_queue2
+        self.running = running
 
     def run(self):
+        order_code = datetime.datetime.now().strftime("%d%m%Y_%H%M%S")
+        timestamp = datetime.datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+
+        # No need for drawtext_cmd1 and drawtext_cmd2 anymore
+
+        cmd1 = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-s', f'{self.width}x{self.height}',
+            '-r', str(self.fps),
+            '-i', '-',
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-b:v', '10000k',
+            '-g', '30',
+            # Removed '-vf', drawtext_cmd1
+            '-pix_fmt', 'yuv420p',
+            self.file_path1
+        ]
+
+        cmd2 = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-s', f'{self.width}x{self.height}',
+            '-r', str(self.fps),
+            '-i', '-',
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-b:v', '10000k',
+            '-g', '30',
+            # Removed '-vf', drawtext_cmd2
+            '-pix_fmt', 'yuv420p',
+            self.file_path2
+        ]
+
+        proc1 = subprocess.Popen(cmd1, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        proc2 = subprocess.Popen(cmd2, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
         while self.running:
-            ret, frame = self.cap.read()
-            if ret:
-                self.mutex.lock()
-                self.latest_frame = frame
-                self.mutex.unlock()
-                self.newFrameSignal.emit()
-            self.msleep(16)  # ~60 fps
+            try:
+                frame1 = self.frame_queue1.get(timeout=1)
+                # frame_np1 = np.frombuffer(frame1, dtype=np.uint8).reshape((self.height, self.width, 3)) # Convert frame bytes to NumPy array
+                # text_to_add1 = f"Cam1 - {order_code} - {timestamp}"
+                # cv2.putText(frame_np1, text_to_add1, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2) # Draw text using OpenCV
+                # frame_with_text1 = frame_np1.tobytes() # Convert NumPy array back to bytes
+                proc1.stdin.write(frame1.tobytes()) # Write frame directly to ffmpeg - frame1 already has text from update_frame
+            except queue.Empty:
+                pass
+
+            try:
+                frame2 = self.frame_queue2.get(timeout=1)
+                # frame_np2 = np.frombuffer(frame2, dtype=np.uint8).reshape((self.height, self.width, 3)) # Convert frame bytes to NumPy array
+                # text_to_add2 = f"Cam2 - {order_code} - {timestamp}"
+                # cv2.putText(frame_np2, text_to_add2, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2) # Draw text using OpenCV
+                # frame_with_text2 = frame_np2.tobytes() # Convert NumPy array back to bytes
+                proc2.stdin.write(frame2.tobytes()) # Write frame directly to ffmpeg - frame2 already has text from update_frame
+            except queue.Empty:
+                pass
+
+        proc1.stdin.close()
+        proc2.stdin.close()
+
+        proc1.wait()
+        proc2.wait()
+
 
     def stop(self):
         self.running = False
         self.wait()
-        self.cap.release()
 
-    def get_frame(self):
-        self.mutex.lock()
-        f = None
-        if self.latest_frame is not None:
-            f = self.latest_frame.copy()
-        self.mutex.unlock()
-        return f
 
-# ------------------------------
-# MainWindow: Giao diện chính
-# ------------------------------
-class MainWindow(QMainWindow):
+
+
+
+class PackRecordPro(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Phần mềm Đóng Gói Hàng Hóa - Quét mã và tự động quay video")
-        self.setGeometry(100, 100, 1280, 720)
-        self.setStyleSheet("""
-            QMainWindow { background-color: #2E2E2E; }
-            QPushButton {
-                background-color: #4CAF50; 
-                color: white; 
-                border: none; 
-                padding: 10px 20px; 
-                font-size: 16px; 
-                border-radius: 5px;
-            }
-            QPushButton:hover { background-color: #45a049; }
-            QLabel { font-size: 14px; color: white; }
-            QLineEdit { font-size: 16px; padding: 5px; }
-        """)
+        self.initUI()
+        self.msgbox = None
+        self.folder = os.path.abspath(".")  # Thư mục hiện tại của ứng dụng
+        self.cam1 = cv2.VideoCapture(0)
+        self.cam2 = cv2.VideoCapture(1)
+        self.cam1.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
+        self.cam1.set(cv2.CAP_PROP_FRAME_HEIGHT, 1440)
+        self.cam2.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
+        self.cam2.set(cv2.CAP_PROP_FRAME_HEIGHT, 1440)
+        if not os.path.exists(self.folder):
+            os.makedirs(self.folder)
+        self.frame_queue1 = Queue()
+        self.frame_queue2 = Queue()
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_frame)
+        self.timer.start(15)
+        self.recording = False
+        self.recorder_thread = None # Initialize recorder_thread to None
 
-        # Thư mục lưu video
-        self.output_folder = os.path.join(os.getcwd(), "recorded_videos")
-        if not os.path.exists(self.output_folder):
-            os.makedirs(self.output_folder)
+    def initUI(self):
+        self.setWindowTitle("PackRecord Pro")
+        self.setGeometry(100, 100, 1400, 600)
 
-        # Các trạng thái ghi video
-        self.manual_recording = False
-        self.manual_writer_thread = None
-        self.manual_queue = None
+        self.label_cam1 = QLabel(self)
+        self.label_cam1.setGeometry(10, 10, 640, 360)
 
-        self.auto_recording = False
-        self.auto_writer_thread = None
-        self.auto_queue = None
-        self.auto_start_time = None
-        self.auto_duration = 10  # ghi tự động 10 giây
-        self.last_code_data = None
+        self.label_cam2 = QLabel(self)
+        self.label_cam2.setGeometry(660, 10, 640, 360)
 
-        # Widget preview
-        self.video_label = QLabel()
-        self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setStyleSheet("background-color: black;")
-        self.video_label.setFixedSize(640, 360)
+        self.entry_order_code = QLineEdit(self)
+        self.entry_order_code.setGeometry(10, 450, 200, 90)
+        self.entry_order_code.setPlaceholderText("Nhập hoặc quét mã đơn hàng")
+        self.entry_order_code.returnPressed.connect(self.start_recording)
 
-        # Trường nhập từ máy quét barcode (hoặc bàn phím)
-        self.scanner_input = QLineEdit()
-        self.scanner_input.setPlaceholderText("Quét mã vạch vào đây...")
-        # Khi người dùng nhấn Enter, bắt đầu auto-record
-        self.scanner_input.returnPressed.connect(self.handle_scanner_input)
 
-        # Các nút điều khiển
-        self.btn_start_manual = QPushButton("Bắt đầu Ghi Thủ Công")
-        self.btn_stop_manual = QPushButton("Dừng Ghi Thủ Công")
-        self.btn_stop_auto = QPushButton("Dừng Quay Tự Động")
-        self.btn_open_folder = QPushButton("Mở Thư Mục Video")
-        self.btn_settings = QPushButton("Cài Đặt")
+        self.btn_start = QPushButton("Bắt đầu quay", self)
+        self.btn_start.setGeometry(220, 500, 120, 40)
+        self.btn_start.clicked.connect(self.start_recording)
 
-        self.btn_start_manual.clicked.connect(self.start_manual_recording)
-        self.btn_stop_manual.clicked.connect(self.stop_manual_recording)
-        self.btn_stop_auto.clicked.connect(self.stop_auto_recording)
-        self.btn_open_folder.clicked.connect(self.open_video_folder)
-        self.btn_settings.clicked.connect(self.open_settings)
+        self.btn_stop = QPushButton("Dừng quay", self)
+        self.btn_stop.setGeometry(350,500, 120, 40)
+        self.btn_stop.clicked.connect(self.stop_recording)
 
-        btn_layout = QHBoxLayout()
-        btn_layout.addWidget(self.btn_start_manual)
-        btn_layout.addWidget(self.btn_stop_manual)
-        btn_layout.addWidget(self.btn_stop_auto)
-        btn_layout.addWidget(self.btn_open_folder)
-        btn_layout.addWidget(self.btn_settings)
+        self.btn_select_folder = QPushButton("Chọn thư mục", self)
+        self.btn_select_folder.setGeometry(480, 500, 120, 40)
+        self.btn_select_folder.clicked.connect(self.select_folder)
 
-        main_layout = QVBoxLayout()
-        main_layout.addWidget(self.video_label)
-        main_layout.addWidget(self.scanner_input)
-        main_layout.addLayout(btn_layout)
+        self.btn_open_folder = QPushButton("Mở thư mục", self)
+        self.btn_open_folder.setGeometry(610, 500, 120, 40)
+        self.btn_open_folder.clicked.connect(self.open_folder)
 
-        container = QWidget()
-        container.setLayout(main_layout)
-        self.setCentralWidget(container)
+        self.status_label = QLabel("Sẵn sàng", self)
+        self.status_label.setGeometry(10, 530, 780, 30)
 
-        # Khởi tạo luồng capture video
-        self.capture_thread = VideoCaptureThread(camera_index=0)
-        self.capture_thread.newFrameSignal.connect(self.on_new_frame)
-        self.capture_thread.start()
+    def update_frame(self):
+        ret1, frame1 = self.cam1.read()
+        ret2, frame2 = self.cam2.read()
+        timestamp = datetime.datetime.now().strftime("%d-%m-%Y %H:%M:%S")
 
-        # Timer decode (30 fps)
-        self.decode_timer = QTimer(self)
-        self.decode_timer.setInterval(33)
-        self.decode_timer.timeout.connect(self.decode_and_check)
-        self.decode_timer.start()
+        order_code = self.entry_order_code.text().strip()
+        if not order_code:
+            order_code = "UNKNOWN"
 
-    def handle_scanner_input(self):
-        """Xử lý dữ liệu từ máy quét barcode (hoặc bàn phím)."""
-        code = self.scanner_input.text().strip()
-        if code:
-            print(f"[Scanner] Phát hiện mã: {code}")
-            # Bắt đầu auto-record nếu chưa đang quay
-            if not self.auto_recording:
-                self.last_code_data = code
-                self.start_auto_recording(code)
-            self.scanner_input.clear()
+        if ret1:
+            text1 = f"Cam1 - {order_code} - {timestamp}"
+            cv2.putText(frame1, text1, (30, 50), cv2.FONT_HERSHEY_SIMPLEX,
+                                    1, (0, 255, 0), 2, cv2.LINE_AA)
 
-    def on_new_frame(self):
-        """Cập nhật preview khi có frame mới."""
-        frame = self.capture_thread.get_frame()
-        if frame is None:
-            return
-        disp = frame.copy()
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cv2.putText(disp, timestamp, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                    1, (0, 0, 255), 2)
-        preview = cv2.resize(disp, (self.video_label.width(), self.video_label.height()),
-                             interpolation=cv2.INTER_AREA)
-        rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        qt_image = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-        self.video_label.setPixmap(QPixmap.fromImage(qt_image))
+            preview1 = cv2.resize(frame1, (800, 450))
+            preview1_rgb = cv2.cvtColor(preview1, cv2.COLOR_BGR2RGB)
+            image1 = QImage(preview1_rgb.data, 800, 450, QImage.Format_RGB888)
+            self.label_cam1.setPixmap(QPixmap.fromImage(image1))
 
-        # Nếu ghi manual, đưa frame vào queue
-        if self.manual_recording and self.manual_queue:
-            try:
-                self.manual_queue.put_nowait(frame.copy())
-            except queue.Full:
-                pass
-        # Nếu ghi auto, đưa frame vào queue
-        if self.auto_recording and self.auto_queue:
-            try:
-                self.auto_queue.put_nowait(frame.copy())
-            except queue.Full:
-                pass
-
-    def decode_and_check(self):
-        """Decode mã vạch (1D/2D) từ frame mới nhất và kích hoạt auto-record nếu phát hiện mã mới."""
-        frame = self.capture_thread.get_frame()
-        if frame is None:
-            return
-
-        results = decode(frame, symbols=[
-            ZBarSymbol.CODE128, ZBarSymbol.CODE39, ZBarSymbol.EAN13,
-            ZBarSymbol.UPCA, ZBarSymbol.UPCE, ZBarSymbol.QRCODE
-        ])
-        if not results:
-            return
-
-        code_obj = results[0]
-        code_data = code_obj.data.decode('utf-8').strip()
-        code_type = code_obj.type
-        print(f"[pyzbar] Phát hiện mã: {code_data}, loại: {code_type}")
-
-        if code_data and code_data != self.last_code_data and not self.auto_recording:
-            self.last_code_data = code_data
-            self.start_auto_recording(code_data)
-
-    # ------------------------------
-    # Manual Recording
-    # ------------------------------
-    def start_manual_recording(self):
-        if self.manual_recording:
-            QMessageBox.warning(self, "Cảnh báo", "Đang ghi video thủ công!")
-            return
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "Chọn file lưu video thủ công",
-            os.path.join(self.output_folder, "manual_video.mp4"),
-            "MP4 Files (*.mp4);;All Files (*)"
-        )
-        if file_path:
-            cap = self.capture_thread.cap
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            if fps < 1:
-                fps = 60.0
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(file_path, fourcc, fps, (width, height))
-            if not writer.isOpened():
-                QMessageBox.critical(self, "Lỗi", "Không mở được VideoWriter!")
-                return
-            self.manual_queue = queue.Queue(maxsize=120)
-            self.manual_writer_thread = WriterThread(writer, self.manual_queue)
-            self.manual_writer_thread.start()
-            self.manual_recording = True
-            QMessageBox.information(self, "Thông báo", "Đã bắt đầu ghi video thủ công.")
-
-    def stop_manual_recording(self):
-        if self.manual_recording:
-            self.manual_recording = False
-            if self.manual_writer_thread:
-                self.manual_writer_thread.stop()
-                self.manual_writer_thread = None
-            self.manual_queue = None
-            QMessageBox.information(self, "Thông báo", "Đã dừng ghi video thủ công.")
-            reply = QMessageBox.question(self, "Tiếp tục quay?",
-                                         "Bạn có muốn quay video mới không?",
-                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if reply == QMessageBox.Yes:
-                QMessageBox.information(self, "Thông báo", "Bạn có thể bấm 'Bắt đầu Ghi Thủ Công' để quay video mới.")
+            if self.recording:
+                self.frame_queue1.put(frame1.copy())
             else:
-                QMessageBox.information(self, "Thông báo", "Không quay thêm video mới.")
+                self.scan_barcode(frame1)  # 🔥 Quét mã QR khi không quay video
+
+        if ret2:
+            text2 = f"Cam2 - {order_code} - {timestamp}"
+            cv2.putText(frame2, text2, (30, 50), cv2.FONT_HERSHEY_SIMPLEX,
+                                    1, (0, 255, 0), 2, cv2.LINE_AA)
+
+            preview2 = cv2.resize(frame2, (800, 450))
+            preview2_rgb = cv2.cvtColor(preview2, cv2.COLOR_BGR2RGB)
+            image2 = QImage(preview2_rgb.data, 800, 450, QImage.Format_RGB888)
+            self.label_cam2.setPixmap(QPixmap.fromImage(image2))
+
+            if self.recording:
+                self.frame_queue2.put(frame2.copy())
+
+
+
+
+    def scan_barcode(self, frame):
+        try:
+            barcodes = decode(frame)
+            if barcodes:
+                order_code = barcodes[0].data.decode('utf-8').strip()
+
+                if order_code:
+                    # Nếu chưa quay hoặc mã đơn hàng mới khác mã cũ → bắt đầu quay lại
+                    if not self.recording or self.entry_order_code.text() != order_code:
+                        self.entry_order_code.setText(order_code)
+                        self.start_recording()  # ✅ Tự động quay ngay khi phát hiện mã QR
+        except Exception as e:
+            print("Barcode decode error:", e)
+
+
+    def show_auto_close_message(self, title, message, timeout=3000):
+        self.msgbox = QMessageBox(self)
+        self.msgbox.setWindowTitle(title)
+        self.msgbox.setText(message)
+        self.msgbox.setStandardButtons(QMessageBox.Ok)  # nên có nút OK
+        self.msgbox.show()
+
+        QTimer.singleShot(timeout, self.msgbox.accept)  # dùng accept thay vì close
+
+
+
+
+
+    def start_recording(self):
+        if not self.recording:
+            order_code = self.entry_order_code.text()
+            if order_code:
+                self.recording = True
+                timestamp = datetime.datetime.now().strftime("%d_%m_%Y")
+                self.file_path1 = f"{self.folder}/{timestamp}_{order_code}_Cam1.mp4"
+                self.file_path2 = f"{self.folder}/{timestamp}_{order_code}_Cam2.mp4"
+
+                # Get width, height, fps from camera or use default values
+                width = int(self.cam1.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(self.cam1.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fps = 30 # You can get FPS from camera if needed: self.cam1.get(cv2.CAP_PROP_FPS) or use a default value
+
+                self.recorder_thread = RecorderThread(
+                    width=width, # Pass width
+                    height=height, # Pass height
+                    fps=fps,     # Pass fps
+                    file_path1=self.file_path1,
+                    file_path2=self.file_path2,
+                    frame_queue1=self.frame_queue1,
+                    frame_queue2=self.frame_queue2,
+                    running=True # Pass running=True
+                )
+                self.recorder_thread.start()
+                self.status_label.setText(f"Đang quay đơn hàng: {order_code}")
+                self.show_auto_close_message("Thông báo", "Đã bắt đầu quay video.")
+
+    def stop_recording(self):
+        if self.recording:
+            if self.recorder_thread is not None: # Check if recorder_thread is initialized
+                self.recorder_thread.running = False
+                self.recorder_thread.wait()
+            self.recording = False
+            msg = QMessageBox()
+            msg.setText(f"Video đã lưu vào thư mục: {self.folder}\nBạn có muốn quay đơn hàng khác không?")
+            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            response = msg.exec_()
+            if response == QMessageBox.Yes:
+                self.entry_order_code.clear()
+                self.status_label.setText("Sẵn sàng")
+            else:
+                self.status_label.setText("Đã dừng quay")
+                self.entry_order_code.clear()
+
+    def select_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục lưu trữ")
+        if folder:
+            self.folder = folder
+            QMessageBox.information(self, "Thông báo", f"Đã chọn thư mục:\n{folder}")
+
+    def open_folder(self):
+        if hasattr(self, 'folder') and self.folder:
+            os.startfile(self.folder)
         else:
-            QMessageBox.warning(self, "Thông báo", "Chưa ghi video thủ công.")
+            QMessageBox.warning(self, "Thông báo", "Bạn chưa chọn thư mục lưu trữ.")
 
-    # ------------------------------
-    # Auto Recording
-    # ------------------------------
-    def start_auto_recording(self, code_data):
-        """Bắt đầu auto-record 10 giây, lưu file theo định dạng ddmmyyyy_{code_data}.mp4."""
-        cap = self.capture_thread.cap
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps < 1:
-            fps = 60.0
 
-        date_str = datetime.now().strftime("%d%m%Y")
-        file_name = f"{date_str}_{code_data}.mp4"
-        file_path = os.path.join(self.output_folder, file_name)
-
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(file_path, fourcc, fps, (width, height))
-        if not writer.isOpened():
-            QMessageBox.critical(self, "Lỗi", "Không mở được VideoWriter auto!")
-            return
-
-        self.auto_queue = queue.Queue(maxsize=120)
-        self.auto_writer_thread = WriterThread(writer, self.auto_queue)
-        self.auto_writer_thread.start()
-        self.auto_recording = True
-        self.auto_start_time = datetime.now()
-        QMessageBox.information(self, "Thông báo",
-                                f"Đã tự động ghi video cho mã: {code_data}\n"
-                                "Sau 10 giây sẽ dừng, hoặc bạn có thể nhấn 'Dừng Quay Tự Động'.")
-
-    def stop_auto_recording(self):
-        if self.auto_recording:
-            self.auto_recording = False
-            if self.auto_writer_thread:
-                self.auto_writer_thread.stop()
-                self.auto_writer_thread = None
-            self.auto_queue = None
-            self.last_code_data = None
-            QMessageBox.information(self, "Thông báo", "Đã dừng auto ghi video.")
-        else:
-            QMessageBox.warning(self, "Thông báo", "Chưa quay auto hoặc đã dừng.")
-
-    # ------------------------------
-    # Mở thư mục, cài đặt, đóng
-    # ------------------------------
-    def open_video_folder(self):
-        QFileDialog.getExistingDirectory(self, "Mở Thư Mục Video", self.output_folder)
-
-    def open_settings(self):
-        QMessageBox.information(self, "Cài Đặt", "Chức năng cài đặt sẽ được phát triển sau.")
 
     def closeEvent(self, event):
-        self.capture_thread.stop()
-        if self.manual_writer_thread:
-            self.manual_writer_thread.stop()
-        if self.auto_writer_thread:
-            self.auto_writer_thread.stop()
-        event.accept()
-
-def main():
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
+        if self.recording:
+            if self.recorder_thread is not None: # Check if recorder_thread is initialized
+                self.recorder_thread.running = False
+                self.recorder_thread.wait()
+        self.cam1.release()
+        self.cam2.release()
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    main()
+    app = QApplication(sys.argv)
+    window = PackRecordPro()
+    window.show()
+    sys.exit(app.exec_())
